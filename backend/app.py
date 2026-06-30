@@ -1,4 +1,6 @@
 import os
+import time
+import random
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import yfinance as yf
@@ -13,13 +15,46 @@ CORS(app, resources={r"/api/*": {"origins": "*"}})
 BSE_SUFFIX = ".BO"
 NSE_SUFFIX = ".NS"
 
+_YF_SESSION = None
+
+def get_yf_session():
+    global _YF_SESSION
+    if _YF_SESSION is None:
+        import requests
+        s = requests.Session()
+        s.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+        })
+        _YF_SESSION = s
+    return _YF_SESSION
+
+
+def yf_ticker(symbol: str) -> yf.Ticker:
+    return yf.Ticker(symbol, session=get_yf_session())
+
+
+def fetch_with_retry(fn, retries=3, base_delay=2.0):
+    for attempt in range(retries):
+        try:
+            return fn()
+        except Exception as e:
+            msg = str(e).lower()
+            if "too many requests" in msg or "rate limit" in msg or "429" in msg:
+                if attempt < retries - 1:
+                    time.sleep(base_delay * (attempt + 1) + random.uniform(0.5, 1.5))
+                    continue
+            raise
+    raise Exception("Rate limited by Yahoo Finance. Please wait a moment and try again.")
+
+
 def get_ticker(company: str) -> tuple[yf.Ticker, str, str]:
     symbol = company.strip().upper()
     for suffix, exchange in [(NSE_SUFFIX, "NSE"), (BSE_SUFFIX, "BSE")]:
-        ticker = yf.Ticker(symbol + suffix)
-        info = ticker.fast_info
+        ticker = yf_ticker(symbol + suffix)
         try:
-            price = info.last_price
+            price = fetch_with_retry(lambda t=ticker: t.fast_info.last_price)
             if price and price > 0:
                 return ticker, symbol + suffix, exchange
         except Exception:
@@ -284,7 +319,9 @@ def analyze():
             (6, "6 Months", "1d"),
         ]:
             start = end - timedelta(days=months * 31)
-            df = ticker.history(start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"), interval=interval)
+            df = fetch_with_retry(lambda s=start, i=interval: ticker.history(
+                start=s.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"), interval=i
+            ))
             if df.empty or len(df) < 20:
                 results.append({"timeframe": label, "error": "Insufficient data"})
                 continue
