@@ -321,7 +321,10 @@ def analyze():
 
     try:
         ticker = yf.Ticker(symbol, session=get_yf_session())
-        info = fetch_with_retry(lambda: ticker.info)
+        try:
+            info = fetch_with_retry(lambda: ticker.info) or {}
+        except Exception:
+            info = {}
         name = info.get("longName") or info.get("shortName") or symbol
         sector = info.get("sector", "N/A")
         industry = info.get("industry", "N/A")
