@@ -242,6 +242,18 @@ def analyze_timeframe(df: pd.DataFrame, label: str):
     }
 
 
+@app.errorhandler(404)
+def not_found(e):
+    if request.path.startswith("/api/"):
+        return jsonify({"error": "Not found"}), 404
+    return send_from_directory(STATIC_DIR, "index.html")
+
+
+@app.errorhandler(500)
+def server_error(e):
+    return jsonify({"error": "Internal server error", "detail": str(e)}), 500
+
+
 @app.route("/api/analyze", methods=["GET"])
 def analyze():
     company = request.args.get("company", "").strip()
@@ -253,43 +265,46 @@ def analyze():
     except ValueError as e:
         return jsonify({"error": str(e)}), 404
 
-    info = ticker.info
-    name = info.get("longName") or info.get("shortName") or symbol
-    sector = info.get("sector", "N/A")
-    industry = info.get("industry", "N/A")
-    market_cap = info.get("marketCap")
-    pe_ratio = info.get("trailingPE")
-    week52_high = info.get("fiftyTwoWeekHigh")
-    week52_low = info.get("fiftyTwoWeekLow")
+    try:
+        info = ticker.info
+        name = info.get("longName") or info.get("shortName") or symbol
+        sector = info.get("sector", "N/A")
+        industry = info.get("industry", "N/A")
+        market_cap = info.get("marketCap")
+        pe_ratio = info.get("trailingPE")
+        week52_high = info.get("fiftyTwoWeekHigh")
+        week52_low = info.get("fiftyTwoWeekLow")
 
-    end = datetime.today()
-    results = []
+        end = datetime.today()
+        results = []
 
-    for months, label, interval in [
-        (1, "1 Month", "1d"),
-        (3, "3 Months", "1d"),
-        (6, "6 Months", "1d"),
-    ]:
-        start = end - timedelta(days=months * 31)
-        df = ticker.history(start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"), interval=interval)
-        if df.empty or len(df) < 20:
-            results.append({"timeframe": label, "error": "Insufficient data"})
-            continue
-        results.append(analyze_timeframe(df, label))
+        for months, label, interval in [
+            (1, "1 Month", "1d"),
+            (3, "3 Months", "1d"),
+            (6, "6 Months", "1d"),
+        ]:
+            start = end - timedelta(days=months * 31)
+            df = ticker.history(start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"), interval=interval)
+            if df.empty or len(df) < 20:
+                results.append({"timeframe": label, "error": "Insufficient data"})
+                continue
+            results.append(analyze_timeframe(df, label))
 
-    return jsonify({
-        "company": name,
-        "symbol": symbol,
-        "exchange": exchange,
-        "sector": sector,
-        "industry": industry,
-        "market_cap": market_cap,
-        "pe_ratio": round(pe_ratio, 2) if pe_ratio else None,
-        "week52_high": week52_high,
-        "week52_low": week52_low,
-        "analysis": results,
-        "disclaimer": "This analysis is for educational purposes only and does not constitute financial advice. Always consult a SEBI-registered advisor before investing.",
-    })
+        return jsonify({
+            "company": name,
+            "symbol": symbol,
+            "exchange": exchange,
+            "sector": sector,
+            "industry": industry,
+            "market_cap": market_cap,
+            "pe_ratio": round(pe_ratio, 2) if pe_ratio else None,
+            "week52_high": week52_high,
+            "week52_low": week52_low,
+            "analysis": results,
+            "disclaimer": "This analysis is for educational purposes only and does not constitute financial advice. Always consult a SEBI-registered advisor before investing.",
+        })
+    except Exception as e:
+        return jsonify({"error": f"Analysis failed: {str(e)}"}), 500
 
 
 def build_strategy(data: dict) -> dict:
