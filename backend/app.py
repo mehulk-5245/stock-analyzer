@@ -15,27 +15,33 @@ CORS(app, resources={r"/api/*": {"origins": "*"}})
 BSE_SUFFIX = ".BO"
 NSE_SUFFIX = ".NS"
 
-_YF_SESSION = None
+# In-memory cache: symbol -> {data, timestamp}
+_cache: dict = {}
+CACHE_TTL = 3600  # 1 hour
+
+
+def cache_get(key: str):
+    entry = _cache.get(key)
+    if entry and (time.time() - entry["ts"]) < CACHE_TTL:
+        return entry["data"]
+    return None
+
+
+def cache_set(key: str, data):
+    _cache[key] = {"data": data, "ts": time.time()}
+
 
 def get_yf_session():
-    global _YF_SESSION
-    if _YF_SESSION is None:
-        import requests
-        s = requests.Session()
-        s.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-        })
-        _YF_SESSION = s
-    return _YF_SESSION
+    import requests
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.5",
+    })
+    return s
 
 
-def yf_ticker(symbol: str) -> yf.Ticker:
-    return yf.Ticker(symbol, session=get_yf_session())
-
-
-def fetch_with_retry(fn, retries=3, base_delay=2.0):
+def fetch_with_retry(fn, retries=4, base_delay=3.0):
     for attempt in range(retries):
         try:
             return fn()
@@ -43,20 +49,29 @@ def fetch_with_retry(fn, retries=3, base_delay=2.0):
             msg = str(e).lower()
             if "too many requests" in msg or "rate limit" in msg or "429" in msg:
                 if attempt < retries - 1:
-                    time.sleep(base_delay * (attempt + 1) + random.uniform(0.5, 1.5))
+                    delay = base_delay * (2 ** attempt) + random.uniform(1, 3)
+                    time.sleep(delay)
                     continue
             raise
-    raise Exception("Rate limited by Yahoo Finance. Please wait a moment and try again.")
+    raise Exception("Yahoo Finance is rate limiting this server. Please try again in a minute.")
 
 
-def get_ticker(company: str) -> tuple[yf.Ticker, str, str]:
+def resolve_symbol(company: str) -> tuple[str, str]:
+    """Return (full_symbol, exchange) for the given company/ticker string."""
     symbol = company.strip().upper()
+    cached = cache_get(f"resolve:{symbol}")
+    if cached:
+        return cached
+
     for suffix, exchange in [(NSE_SUFFIX, "NSE"), (BSE_SUFFIX, "BSE")]:
-        ticker = yf_ticker(symbol + suffix)
+        full = symbol + suffix
         try:
+            ticker = yf.Ticker(full, session=get_yf_session())
             price = fetch_with_retry(lambda t=ticker: t.fast_info.last_price)
             if price and price > 0:
-                return ticker, symbol + suffix, exchange
+                result = (full, exchange)
+                cache_set(f"resolve:{symbol}", result)
+                return result
         except Exception:
             pass
     raise ValueError(f"Could not find '{company}' on NSE or BSE. Try the exact ticker symbol.")
@@ -296,12 +311,17 @@ def analyze():
         return jsonify({"error": "company parameter is required"}), 400
 
     try:
-        ticker, symbol, exchange = get_ticker(company)
+        symbol, exchange = resolve_symbol(company)
     except ValueError as e:
         return jsonify({"error": str(e)}), 404
 
+    cached = cache_get(f"analyze:{symbol}")
+    if cached:
+        return jsonify(cached)
+
     try:
-        info = ticker.info
+        ticker = yf.Ticker(symbol, session=get_yf_session())
+        info = fetch_with_retry(lambda: ticker.info)
         name = info.get("longName") or info.get("shortName") or symbol
         sector = info.get("sector", "N/A")
         industry = info.get("industry", "N/A")
@@ -310,24 +330,35 @@ def analyze():
         week52_high = info.get("fiftyTwoWeekHigh")
         week52_low = info.get("fiftyTwoWeekLow")
 
+        # Single bulk download covering 6 months — slice for each timeframe
         end = datetime.today()
-        results = []
+        start_bulk = end - timedelta(days=6 * 31)
+        df_all = fetch_with_retry(lambda: yf.download(
+            symbol,
+            start=start_bulk.strftime("%Y-%m-%d"),
+            end=end.strftime("%Y-%m-%d"),
+            interval="1d",
+            progress=False,
+            session=get_yf_session(),
+        ))
 
-        for months, label, interval in [
-            (1, "1 Month", "1d"),
-            (3, "3 Months", "1d"),
-            (6, "6 Months", "1d"),
-        ]:
-            start = end - timedelta(days=months * 31)
-            df = fetch_with_retry(lambda s=start, i=interval: ticker.history(
-                start=s.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"), interval=i
-            ))
+        if df_all.empty:
+            return jsonify({"error": f"No market data returned for {symbol}. Market may be closed or symbol invalid."}), 404
+
+        # Flatten MultiIndex columns if present (yf.download returns them)
+        if isinstance(df_all.columns, pd.MultiIndex):
+            df_all.columns = df_all.columns.get_level_values(0)
+
+        results = []
+        for months, label in [(1, "1 Month"), (3, "3 Months"), (6, "6 Months")]:
+            cutoff = end - timedelta(days=months * 31)
+            df = df_all[df_all.index >= pd.Timestamp(cutoff)].copy()
             if df.empty or len(df) < 20:
                 results.append({"timeframe": label, "error": "Insufficient data"})
                 continue
             results.append(analyze_timeframe(df, label))
 
-        return jsonify({
+        payload = {
             "company": name,
             "symbol": symbol,
             "exchange": exchange,
@@ -339,7 +370,9 @@ def analyze():
             "week52_low": week52_low,
             "analysis": results,
             "disclaimer": "This analysis is for educational purposes only and does not constitute financial advice. Always consult a SEBI-registered advisor before investing.",
-        })
+        }
+        cache_set(f"analyze:{symbol}", payload)
+        return jsonify(payload)
     except Exception as e:
         return jsonify({"error": f"Analysis failed: {str(e)}"}), 500
 
